@@ -1,0 +1,18 @@
+# Ignorer tout par défaut
+*
+
+# Ne pas ignorer les fichiers Python
+!*.py
+
+# Ne pas ignorer les notebooks Jupyter
+!*.ipynb
+
+# Ne pas ignorer le .gitignore lui-même
+!.gitignore
+
+# Ne pas ignorer les dossiers (mais ignorer leur contenu)
+!*/
+
+# Toujours ignorer les dossiers de cache
+__pycache__/
+.ipynb_checkpoints/
