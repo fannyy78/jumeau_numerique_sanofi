@@ -34,3 +34,5 @@ Le notebook `analyse_avec_visuels.ipynb` contient :
 - Calculs de l'indice de Moran
 - Analyses de régression
 - Visualisations associées
+
+Les bases de données ne sont pas fournis dans ce répertoire, et de même pour les cartes et résultats car trop lourds pour GIT HUB.
