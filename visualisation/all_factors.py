@@ -1,0 +1,175 @@
+import os 
+import pandas as pd 
+import geopandas as gpd
+import folium
+from branca.element import MacroElement 
+from jinja2 import Template 
+from IPython.display import IFrame 
+import webbrowser
+
+base_dir = "/home/oneai/jumeau_num"
+
+# Vérification de l'existence du dossier
+if not os.path.exists(base_dir):
+    raise FileNotFoundError(f"Le dossier {base_dir} n'existe pas !")
+
+# Définition des chemins vers les fichiers
+gdf_com_2024_path = os.path.join(base_dir, "gdf_com_2024.geojson")
+gdf_dep_path = os.path.join(base_dir, "gdf_dep.geojson")
+factors_path = os.path.join(base_dir, "tables", "factors_for_visualization.csv")
+codes_geo_2024_path = os.path.join(base_dir, "insee_millesime_importation", "v_commune_2024.csv")
+
+# Chargement des fichiers
+gdf_com_2024 = gpd.read_file(gdf_com_2024_path)
+gdf_dep = gpd.read_file(gdf_dep_path)
+factors = pd.read_csv(factors_path)
+codes_geo_2024 = pd.read_csv(codes_geo_2024_path)
+
+
+# ---------- Correction canton ----------
+factors['canton'] = factors['canton'].astype(str).str.replace(r'\.0$', '', regex=True)
+factors['canton'] = factors['canton'].apply(lambda x: x.zfill(4) if len(x) == 3 else x)
+
+# ---------- Fusion pour ajouter la colonne 'canton' ----------
+gdf_com_2024 = gdf_com_2024.merge(
+    codes_geo_2024[['COM', 'CAN']],
+    left_on='COM_geojson',
+    right_on='COM',
+    how='left'
+)
+gdf_com_2024 = gdf_com_2024.drop(columns=['COM', 'COM_geojson'])
+gdf_com_2024 = gdf_com_2024.rename(columns={'CAN':'canton'})
+
+# ---------- Regrouper par canton ----------
+gdf_cantons = gdf_com_2024.dissolve(by='canton', as_index=False)
+
+# ---------- Gestion MultiPolygon ----------
+def to_single_polygon(geom):
+    if isinstance(geom, MultiPolygon):
+        return max(geom.geoms, key=lambda a: a.area)
+    return geom
+
+gdf_cantons['geometry'] = gdf_cantons['geometry'].apply(to_single_polygon)
+gdf_cantons['geometry'] = gdf_cantons['geometry'].simplify(tolerance=0.001, preserve_topology=True)
+
+# ---------- Moyenne des facteurs par canton ----------
+factors['canton'] = factors['canton'].astype(str)
+gdf_cantons['canton'] = gdf_cantons['canton'].astype(str)
+
+facteur_columns = [col for col in factors.columns if col not in ['codgeo', 'libgeo', 'cluster', 'canton']]
+factors_canton = factors.groupby('canton')[facteur_columns].mean().reset_index()
+
+# ---------- Fonction de classification ----------
+def classify_factors(df, exclude_cols=["codgeo", "cluster", "libgeo", "canton"]):
+    df_classified = df.copy()
+    num_cols = df_classified.select_dtypes(include="number").columns
+    num_cols = [c for c in num_cols if c not in exclude_cols]
+
+    for col in num_cols:
+        q1 = df_classified[col].quantile(0.25)
+        q2 = df_classified[col].quantile(0.50)
+        q3 = df_classified[col].quantile(0.75)
+
+        def classify(val):
+            if pd.isna(val):
+                return None
+            elif val == 0:
+                return 0
+            elif val <= q1:
+                return 1
+            elif val <= q2:
+                return 2
+            elif val <= q3:
+                return 3
+            else:
+                return 4
+
+        df_classified[col] = df_classified[col].apply(classify)
+
+    return df_classified
+
+factors_canton = classify_factors(factors_canton)
+
+
+# ---------- Fusion avec les géométries des cantons ----------
+gdf_factors = gdf_cantons.merge(factors_canton, on='canton', how='left')
+
+# ---------- Reprojection et calcul des centroïdes ----------
+gdf_factors_proj = gdf_factors.to_crs(epsg=2154)
+gdf_factors_proj['centroid'] = gdf_factors_proj.geometry.centroid
+centroids_wgs84 = gdf_factors_proj.set_geometry('centroid').to_crs(epsg=4326)
+gdf_factors['lon'] = centroids_wgs84.geometry.x
+gdf_factors['lat'] = centroids_wgs84.geometry.y
+
+
+# ---------- Colonnes facteurs ----------
+exclude_cols = ["canton","Cluster","geometry","lon","lat"]
+facteur_columns = [col for col in gdf_factors.columns if col not in exclude_cols and pd.api.types.is_numeric_dtype(gdf_factors[col])]
+facteur_columns = facteur_columns[:10]  # limiter aux 10 premiers facteurs pour la carte
+print("Facteurs retenus :", facteur_columns)
+
+# ---------- Couleurs ----------
+factor_colors = {0: "lightgray", 1: "blue", 2: "green", 3: "orange", 4: "red"}
+
+# ---------- Légende ----------
+legend_html = """
+<div style="
+    position: fixed;
+    bottom: 50px; left: 50px;
+    width: 220px; height: 190px;
+    background-color: white;
+    border:2px solid grey;
+    z-index:9999;
+    font-size:14px;
+    padding: 10px;">
+    <b>Légende niveaux facteurs</b><br>
+    <i style="background: lightgray; width: 15px; height: 15px; float: left; margin-right: 8px;"></i> 0 : valeur nulle<br>
+    <i style="background: blue; width: 15px; height: 15px; float: left; margin-right: 8px;"></i> 1 : ≤ Q1<br>
+    <i style="background: green; width: 15px; height: 15px; float: left; margin-right: 8px;"></i> 2 : ≤ médiane<br>
+    <i style="background: orange; width: 15px; height: 15px; float: left; margin-right: 8px;"></i> 3 : ≤ Q3<br>
+    <i style="background: red; width: 15px; height: 15px; float: left; margin-right: 8px;"></i> 4 : > Q3<br>
+</div>
+"""
+
+# ---------- Fonction style ----------
+def style_function_factory(facteur):
+    def style_function(feature):
+        val = feature['properties'].get(facteur)
+        if val is None:
+            return {'fillOpacity':0, 'color':'black', 'weight':0.1}
+        try:
+            val = int(val)
+        except:
+            return {'fillOpacity':0, 'color':'black', 'weight':0.1}
+        color = factor_colors.get(val, 'black')
+        return {'fillColor': color, 'color':'black', 'weight':0.3, 'fillOpacity':0.7}
+    return style_function
+
+# ---------- Carte Folium ----------
+carte_france = folium.Map(location=[46.6, 2.5], zoom_start=6, tiles="CartoDB positron")
+bounds_sud_ouest, bounds_nord_est = [41.0, -5.0], [51.5, 9.5]
+carte_france.fit_bounds([bounds_sud_ouest, bounds_nord_est])
+carte_france.options['maxBounds'] = [bounds_sud_ouest, bounds_nord_est]
+
+# ---------- Ajouter chaque facteur comme FeatureGroup ----------
+for i, facteur in enumerate(facteur_columns[:10]):
+    fg = folium.FeatureGroup(name=facteur, show=(i==0))  # premier facteur visible
+    folium.GeoJson(
+        gdf_factors,
+        style_function=style_function_factory(facteur),
+        tooltip=folium.GeoJsonTooltip(
+            fields=['canton', facteur],
+            aliases=['Canton', facteur],
+            localize=True
+        )
+    ).add_to(fg)
+    fg.add_to(carte_france)
+
+carte_france.get_root().html.add_child(folium.Element(legend_html))
+
+# ---------- Contrôle des couches ----------
+folium.LayerControl(collapsed=False).add_to(carte_france)
+
+# ---------- Affichage ----------
+display(carte_france)
+
